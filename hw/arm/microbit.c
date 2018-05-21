@@ -12,6 +12,8 @@
 #include "hw/timer/cmsdk-apb-timer.h"
 #include "hw/devices.h"
 #include "qemu/log.h"
+#include "hw/loader.h"
+#include "hw/block/flash.h"
 
 /**
  * NRF51 Timer
@@ -378,11 +380,93 @@ typedef struct {
 #define MICROBIT_MACHINE_CLASS(klass) \
     OBJECT_CLASS_CHECK(MICROBITMachineClass, (klass), TYPE_MICROBIT_MACHINE)
 
+enum {
+    STARTUP_ADDR = 0x00018000,
+    VECTOR_SIZE  = 0xC0,
+    NUM_IRQ      = 64,
+
+    /* Memory regions */
+    CODE_LOADER_BASE = 0x00000000,
+    CODE_LOADER_SIZE = 0x00018000,
+    CODE_KERNEL_BASE = 0x00018000,
+    CODE_KERNEL_SIZE = 0x00028000,
+    FLASH_SEC_SIZE   = 0x00008000,
+    RAM_BASE         = 0x20000000,
+
+    /* ABP Peripherals */
+    ABP_PERI_BASE = 0x40000000,
+    ABP_PERI_SIZE = 0x00080000,
+    POWER_BASE    = 0x40000000,
+    CLOCK_BASE    = 0x40000000,
+    MPU_BASE      = 0x40000000,
+    AMLI_BASE     = 0x40000000,
+    RADIO_BASE    = 0x40001000,
+    UART0_BASE    = 0x40002000,
+    SPI0_BASE     = 0x40003000,
+    TWI0_BASE     = 0x40003000,
+    SPI1_BASE     = 0x40004000,
+    TWI1_BASE     = 0x40004000,
+    SPIS1_BASE    = 0x40004000,
+    SPIM1_BASE    = 0x40004000,
+    GPIOTE_BASE   = 0x40006000,
+    ADC_BASE      = 0x40007000,
+    TIMER0_BASE   = 0x40008000,
+    TIMER1_BASE   = 0x40009000,
+    TIMER2_BASE   = 0x4000A000,
+    RTC0_BASE     = 0x4000B000,
+    TEMP_BASE     = 0x4000C000,
+    RNG_BASE      = 0x4000D000,
+    ECB_BASE      = 0x4000E000,
+    AAR_BASE      = 0x4000F000,
+    CCM_BASE      = 0x4000F000,
+    WDT_BASE      = 0x40010000,
+    RTC1_BASE     = 0x40011000,
+    QDEC_BASE     = 0x40012000,
+    LPCOMP_BASE   = 0x40013000,
+    SWI_BASE      = 0x40014000,
+    NVMC_BASE     = 0x4001E000,
+    PPI_BASE      = 0x4001F000
+};
+
+static void microbit_cpu_reset(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    cpu_reset(CPU(cpu));
+}
+
+static void microbit_load_kernel(ARMCPU *cpu, const char *kernel_filename,
+                                 int mem_size)
+{
+    int ret;
+    ret = load_image_targphys(kernel_filename, STARTUP_ADDR, mem_size);
+
+    if (ret < 0) {
+        error_report("%s: Failed to load file %s", __func__,
+                     kernel_filename);
+        exit(1);
+    }
+
+    qemu_register_reset(microbit_cpu_reset, cpu);
+}
+
+static void microbit_copy_vector(MemoryRegion *dest_mem, hwaddr src_base)
+{
+    uint32_t data;
+    uint32_t* dest = (uint32_t *)memory_region_get_ram_ptr(dest_mem);
+    for(int i = 0; i < VECTOR_SIZE / 4; i++) {
+        data = ldl_p(rom_ptr(src_base + i * 4));
+        dest[i] = data;
+    }
+}
+
 static void microbit_init(MachineState *machine)
 {
     MemoryRegion *ram = g_new(MemoryRegion, 1);
-    MemoryRegion *code = g_new(MemoryRegion, 1);
+    MemoryRegion *code_loader = g_new(MemoryRegion, 1);
     MemoryRegion *apb_peri = g_new(MemoryRegion, 1);
+    DriveInfo *dinfo;
+    pflash_t *flash;
 
     MachineClass *mc = MACHINE_GET_CLASS(machine);
     MICROBITMachineState *mbs = MICROBIT_MACHINE(machine);
@@ -399,70 +483,58 @@ static void microbit_init(MachineState *machine)
         exit(1);
     }
 
+    /* Initial architecture */
     object_initialize(&mbs->armv7m, sizeof(mbs->armv7m), TYPE_ARMV7M);
     armv7m = DEVICE(&mbs->armv7m);
-
     qdev_set_parent_bus(armv7m, sysbus_get_default());
-    qdev_prop_set_uint32(armv7m, "num-irq", 64);
+    qdev_prop_set_uint32(armv7m, "num-irq", NUM_IRQ);
     qdev_prop_set_string(armv7m, "cpu-type", machine->cpu_type);
     object_property_set_link(OBJECT(armv7m), OBJECT(get_system_memory()),
                                      "memory", &error_abort);
     object_property_set_bool(OBJECT(armv7m), true, "realized",
                              &error_fatal);
 
-    /* RAM: 0x20000000, 16KB - 32KB */
+    /* RAM */
     memory_region_allocate_system_memory(ram, NULL, "microbit.ram",
                                          machine->ram_size);
-    memory_region_add_subregion(get_system_memory(), 0x20000000, ram);
+    memory_region_add_subregion(get_system_memory(), RAM_BASE, ram);
 
-    /* CODE: 0x00000000, 128KB or 256KB
-     * TODO: use flash instead of ram
-     */
-    memory_region_allocate_system_memory(code, NULL, "microbit.code",
-                                         128 * 1024);
-    memory_region_add_subregion(get_system_memory(), 0x00000000, code);
+    /* CODE: ROM */
+    memory_region_allocate_system_memory(code_loader, NULL,
+                                         "microbit.code_loader",
+                                         CODE_LOADER_SIZE);
+    memory_region_set_readonly(code_loader, true);
+    memory_region_add_subregion(get_system_memory(), CODE_LOADER_BASE,
+                                code_loader);
 
-    /**
-     * APB Peripheral: 0x40000000 - 0x40080000
-     *     POWER    0x40000000
-     *     CLOCK    0x40000000
-     *     MPU      0x40000000
-     *     AMLI     0x40000000
-     *     RADIO    0x40001000
-     *     UART0    0x40002000
-     *     SPI0     0x40003000
-     *     TWI0     0x40003000
-     *     SPI1     0x40004000
-     *     TWI1     0x40004000
-     *     SPIS1    0x40004000
-     *     SPIM1    0x40004000
-     *     GPIOTE   0x40006000
-     *     ADC      0x40007000
-     *     TIMER0   0x40008000
-     *     TIMER1   0x40009000
-     *     TIMER2   0x4000A000
-     *     RTC0     0x4000B000
-     *     TEMP     0x4000C000
-     *     RNG      0x4000D000
-     *     ECB      0x4000E000
-     *     AAR      0x4000F000
-     *     CCM      0x4000F000
-     *     WDT      0x40010000
-     *     RTC1     0x40011000
-     *     QDEC     0x40012000
-     *     LPCOMP   0x40013000
-     *     SWI      0x40014000
-     *     NVMC     0x4001E000
-     *     PPI      0x4001F000
-     */
-    memory_region_init(apb_peri, NULL, "microbit.apb_peripheral", 0x00080000);
-    memory_region_add_subregion(get_system_memory(), 0x40000000, apb_peri);
-    create_unimplemented_device("pwr_clk_mpu", 0x40000000, 0x1000);
-    sysbus_create_simple(TYPE_NRF51_TIMER, 0x40008000, qdev_get_gpio_in(armv7m, 8));
-    sysbus_create_simple(TYPE_NRF51_TIMER, 0x40009000, qdev_get_gpio_in(armv7m, 9));
-    sysbus_create_simple(TYPE_NRF51_TIMER, 0x4000A000, qdev_get_gpio_in(armv7m, 10));
+    /* CODE: FLASH */
+    dinfo = drive_get(IF_PFLASH, 0, 0);
+    flash = pflash_cfi01_register(CODE_KERNEL_BASE, NULL, "microbit.code_kernel",
+                                  CODE_KERNEL_SIZE,
+                                  dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+                                  FLASH_SEC_SIZE, CODE_KERNEL_SIZE / FLASH_SEC_SIZE,
+                                  4, 0x0000, 0x0000, 0x0000, 0x0000, 0);
+    if(!flash){
+        error_report("%s: Error registering flash memory.\n", __func__);
+        exit(1);
+    }
 
-    armv7m_load_kernel(ARM_CPU(first_cpu), machine->kernel_filename, 128 * 1024);
+    /* Peripherals */
+    memory_region_init(apb_peri, NULL, "microbit.apb_peripheral",
+                       ABP_PERI_SIZE);
+    memory_region_add_subregion(get_system_memory(), ABP_PERI_BASE, apb_peri);
+    create_unimplemented_device("pwr_clk_mpu", POWER_BASE, 0x1000);
+    sysbus_create_simple(TYPE_NRF51_TIMER, TIMER0_BASE,
+                         qdev_get_gpio_in(armv7m, 8));
+    sysbus_create_simple(TYPE_NRF51_TIMER, TIMER1_BASE,
+                         qdev_get_gpio_in(armv7m, 9));
+    sysbus_create_simple(TYPE_NRF51_TIMER, TIMER2_BASE,
+                         qdev_get_gpio_in(armv7m, 10));
+
+    /* Load binary image */
+    microbit_load_kernel(ARM_CPU(first_cpu), machine->kernel_filename,
+                         CODE_KERNEL_SIZE);
+    microbit_copy_vector(code_loader, CODE_KERNEL_BASE);
 }
 
 static void microbit_class_init(ObjectClass *oc, void *data)
