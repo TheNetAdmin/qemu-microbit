@@ -14,6 +14,594 @@
 #include "qemu/log.h"
 #include "hw/loader.h"
 #include "hw/block/flash.h"
+#include "hw/ptimer.h"
+#include "crypto/random.h"
+
+/**
+ * NRF51 RNG
+ *   Random Number Generator
+ *   NOTE: ought to raise irq, but microbit does not handle it
+ *         so ommit the irq implementation
+ */
+
+#define TYPE_NRF51_RNG "nrf51_rng"
+#define NRF51_RNG(obj) \
+    OBJECT_CHECK(NRF51RNGState, (obj), TYPE_NRF51_RNG)
+
+enum {
+    NRF51_RNG_START    = 0x000,
+    NRF51_RNG_STOP     = 0x004,
+    NRF51_RNG_VALRDY   = 0x100,
+    NRF51_RNG_SHORTS   = 0x200,
+    NRF51_RNG_INTEN    = 0x300,
+    NRF51_RNG_INTENSET = 0x304,
+    NRF51_RNG_INTENCLR = 0x308,
+    NRF51_RNG_CONFIG   = 0x504,
+    NRF51_RNG_VALUE    = 0x508,
+};
+
+typedef struct {
+    /* Private */
+    SysBusDevice parent;
+
+    /* Public */
+    MemoryRegion iomem;
+    uint8_t value;
+    uint32_t config;
+    bool ready;
+    bool started;
+} NRF51RNGState;
+
+static const VMStateDescription vmstate_nrf51_rng = {
+    .name = TYPE_NRF51_RNG,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT8(value, NRF51RNGState),
+        VMSTATE_UINT32(config, NRF51RNGState),
+        VMSTATE_BOOL(ready, NRF51RNGState),
+        VMSTATE_BOOL(started, NRF51RNGState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static Property nrf51_rng_properties[] = {
+    DEFINE_PROP_UINT8("value", NRF51RNGState, value, 0),
+    DEFINE_PROP_UINT32("config", NRF51RNGState, config, 0),
+    DEFINE_PROP_BOOL("ready", NRF51RNGState, ready, false),
+    DEFINE_PROP_BOOL("started", NRF51RNGState, started, false),
+    DEFINE_PROP_END_OF_LIST()
+};
+
+static uint64_t nrf51_rng_read(void *opaque, hwaddr offset,
+                               unsigned size)
+{
+    NRF51RNGState *s = (NRF51RNGState *)opaque;
+
+    switch (offset) {
+        case NRF51_RNG_START:
+            return s->started;
+        case NRF51_RNG_STOP:
+            return s->started;
+        case NRF51_RNG_VALRDY:
+            /* Always ready, actually generated when reading VALUE*/
+            return (s->started) && 1; 
+        case NRF51_RNG_SHORTS:
+        case NRF51_RNG_INTEN:
+        case NRF51_RNG_INTENSET:
+        case NRF51_RNG_INTENCLR:
+            qemu_log_mask(LOG_UNIMP,
+                          "%s: writing unimp offset 0x%x\n",
+                          __func__,
+                          (int)offset);
+            return 0;
+        case NRF51_RNG_VALUE:
+            qcrypto_random_bytes(&s->value, 1, &error_fatal);
+            return s->value;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                            "%s: reading a bad offset 0x%x\n",
+                            __func__,
+                            (int)offset);
+            return 0;
+    }
+}
+
+static void nrf51_rng_write(void *opaque, hwaddr offset,
+                            uint64_t value, unsigned size)
+{
+    NRF51RNGState *s = (NRF51RNGState *)opaque;
+
+    switch (offset) {
+        case NRF51_RNG_START:
+            s->started = true;
+            break;
+        case NRF51_RNG_STOP:
+            s->started = false;
+            break;
+        case NRF51_RNG_CONFIG:
+            s->config = value & 1;
+            break;
+        case NRF51_RNG_SHORTS:
+        case NRF51_RNG_INTEN:
+        case NRF51_RNG_INTENSET:
+        case NRF51_RNG_INTENCLR:
+        case NRF51_RNG_VALRDY:
+            qemu_log_mask(LOG_UNIMP,
+                          "%s: writing unimp offset 0x%x\n",
+                          __func__,
+                          (int)offset);
+            break;
+        case NRF51_RNG_VALUE:
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                            "%s: writing a bad offset 0x%x\n",
+                            __func__,
+                            (int)offset);
+            break;
+    }
+}
+
+static const MemoryRegionOps nrf51_rng_ops = {
+    .read = nrf51_rng_read,
+    .write = nrf51_rng_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static void nrf51_rng_init(Object *obj)
+{
+    NRF51RNGState *s = NRF51_RNG(obj);
+    SysBusDevice *sdb = SYS_BUS_DEVICE(obj);
+
+    memory_region_init_io(&s->iomem, obj, &nrf51_rng_ops, s,
+                          TYPE_NRF51_RNG, 0x1000);
+    sysbus_init_mmio(sdb, &s->iomem);
+}
+
+static void nrf51_rng_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->props = nrf51_rng_properties;
+    dc->vmsd = &vmstate_nrf51_rng;
+}
+
+static const TypeInfo nrf51_rng_info = {
+    .name          = TYPE_NRF51_RNG,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(NRF51RNGState),
+    .instance_init = nrf51_rng_init,
+    .class_init    = nrf51_rng_class_init,
+};
+
+/**
+ * NRF51 NVMC
+ *   Non-Volatile Memory Controller
+ */
+
+#define TYPE_NRF51_NVMC "nrf51_nvmc"
+#define NRF51_NVMC(obj) \
+    OBJECT_CHECK(NRF51NVMCState, (obj), TYPE_NRF51_NVMC)
+
+enum{
+    NRF51_NVMC_READY     = 0x400,
+    NRF51_NVMC_CONFIG    = 0x504,
+    NRF51_NVMC_ERASEPAGE = 0x508,
+    NRF51_NVMC_ERASEPCR1 = 0x508,
+    NRF51_NVMC_ERASEALL  = 0x50C,
+    NRF51_NVMC_ERASEPCR0 = 0x510,
+    NRF51_NVMC_ERASEUICR = 0x514,
+};
+
+typedef struct {
+    /* Private */
+    SysBusDevice parent;
+
+    /* Public */
+    MemoryRegion iomem;
+    uint32_t ready;
+    uint32_t config;
+} NRF51NVMCState;
+
+static uint64_t nrf51_nvmc_read(void *opaque, hwaddr offset,
+                                unsigned size)
+{
+    NRF51NVMCState *s = (NRF51NVMCState *)opaque;
+    
+    switch (offset) {
+        case NRF51_NVMC_READY:
+            return s->ready;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                            "%s: reading a bad offset 0x%x\n",
+                            __func__,
+                            (int)offset);
+            return 0;
+    }
+}
+
+static void nrf51_nvmc_write(void *opaque, hwaddr offset,
+                             uint64_t value, unsigned size)
+{
+    NRF51NVMCState *s = (NRF51NVMCState *)opaque;
+    
+    switch (offset) {
+        case NRF51_NVMC_CONFIG:
+            s->config = value;
+            break;
+        case NRF51_NVMC_READY:
+        case NRF51_NVMC_ERASEPAGE:
+        /* case NRF51_NVMC_ERASEPCR1: OVERLAPPED */
+        case NRF51_NVMC_ERASEALL:
+        case NRF51_NVMC_ERASEPCR0:
+        case NRF51_NVMC_ERASEUICR:
+            qemu_log_mask(LOG_UNIMP,
+                          "%s: writing unimp offset 0x%x\n",
+                          __func__,
+                          (int)offset);
+            break;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                            "%s: writing a bad offset 0x%x\n",
+                            __func__,
+                            (int)offset);
+            break;
+    }
+}
+
+static const MemoryRegionOps nrf51_nvmc_ops = {
+    .read = nrf51_nvmc_read,
+    .write = nrf51_nvmc_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static const VMStateDescription vmstate_nrf51_nvmc = {
+    .name = TYPE_NRF51_NVMC,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(ready, NRF51NVMCState),
+        VMSTATE_UINT32(config, NRF51NVMCState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static Property nrf51_nvmc_properties[] = {
+    DEFINE_PROP_UINT32("ready", NRF51NVMCState, ready, 1),
+    DEFINE_PROP_UINT32("config", NRF51NVMCState, config, 0),
+    DEFINE_PROP_END_OF_LIST()
+};
+
+static void nrf51_nvmc_init(Object *obj)
+{
+    NRF51NVMCState *s = NRF51_NVMC(obj);
+    SysBusDevice *sdb = SYS_BUS_DEVICE(obj);
+
+    memory_region_init_io(&s->iomem, obj, &nrf51_nvmc_ops, s,
+                          TYPE_NRF51_NVMC, 0x1000);
+    sysbus_init_mmio(sdb, &s->iomem);
+}
+
+static void nrf51_nvmc_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->props = nrf51_nvmc_properties;
+    dc->vmsd = &vmstate_nrf51_nvmc;
+}
+
+static const TypeInfo nrf51_nvmc_info = {
+    .name          = TYPE_NRF51_NVMC,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(NRF51NVMCState),
+    .instance_init = nrf51_nvmc_init,
+    .class_init    = nrf51_nvmc_class_init,
+};
+
+/**
+ * NRF51 FICR
+ */
+
+#define TYPE_NRF51_FICR "nrf51_ficr"
+#define NRF51_FICR(obj) \
+    OBJECT_CHECK(NRF51FICRState, (obj), TYPE_NRF51_FICR)
+
+enum{
+    NRF51_FICR_CODEPAGESIZE = 0x010,
+    NRF51_FICR_CODESIZE = 0x014,
+    NRF51_FICR_CLENR0 = 0x028,
+    NRF51_FICR_PPFC = 0x02C,
+    NRF51_FICR_NUMRAMBLOCK = 0x034,
+    NRF51_FICR_SIZERAMBLOCKS = 0x038,
+    NRF51_FICR_SIZERAMBLOCK0 = 0x038,
+    NRF51_FICR_SIZERAMBLOCK1 = 0x03C,
+    NRF51_FICR_SIZERAMBLOCK2 = 0x040,
+    NRF51_FICR_SIZERAMBLOCK3 = 0x044,
+    NRF51_FICR_CONFIGID = 0x05C,
+    NRF51_FICR_DEVICEID0 = 0x060,
+    NRF51_FICR_DEVICEID1 = 0x064,
+    NRF51_FICR_ER0 = 0x080,
+    NRF51_FICR_ER1 = 0x084,
+    NRF51_FICR_ER2 = 0x088,
+    NRF51_FICR_ER3 = 0x08C,
+    NRF51_FICR_IR0 = 0x090,
+    NRF51_FICR_IR1 = 0x094,
+    NRF51_FICR_IR2 = 0x098,
+    NRF51_FICR_IR3 = 0x09C,
+    NRF51_FICR_DEVICEADDRTYPE = 0x0A0,
+    NRF51_FICR_DEVICEADDR0 = 0x0A4,
+    NRF51_FICR_DEVICEADDR1 = 0x0A8,
+    NRF51_FICR_OVERRIDEEN = 0x0AC,
+    NRF51_FICR_NRF_1MBIT0 = 0x0B0,
+    NRF51_FICR_NRF_1MBIT1 = 0x0B4,
+    NRF51_FICR_NRF_1MBIT2 = 0x0B8,
+    NRF51_FICR_NRF_1MBIT3 = 0x0BC,
+    NRF51_FICR_NRF_1MBIT4 = 0x0C0,
+    NRF51_FICR_BLE_1MBIT0 = 0x0EC,
+    NRF51_FICR_BLE_1MBIT1 = 0x0F0,
+    NRF51_FICR_BLE_1MBIT2 = 0x0F4,
+    NRF51_FICR_BLE_1MBIT3 = 0x0F8,
+    NRF51_FICR_BLE_1MBIT4 = 0x0FC,
+};
+
+typedef struct {
+    /* Private */
+    SysBusDevice parent;
+
+    /* Public */
+    MemoryRegion iomem;
+    uint32_t codepagesize;
+    uint32_t codesize;
+
+} NRF51FICRState;
+
+static uint64_t nrf51_ficr_read(void *opaque, hwaddr offset,
+                                unsigned size)
+{
+    NRF51FICRState *s = (NRF51FICRState *)opaque;
+
+    switch (offset) {
+        case NRF51_FICR_CODEPAGESIZE:
+            return s->codepagesize;
+        case NRF51_FICR_CODESIZE:
+            return s->codesize;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                            "%s: reading a bad offset 0x%x\n",
+                            __func__,
+                            (int)offset);
+            return 0;
+    };
+}
+
+static void nrf51_ficr_write(void *opaque, hwaddr offset,
+                             uint64_t value, unsigned size)
+{
+    NRF51FICRState *s = (NRF51FICRState *)opaque;
+
+    switch (offset) {
+        case NRF51_FICR_CODEPAGESIZE:
+            s->codepagesize = value;
+            break;
+        case NRF51_FICR_CODESIZE:
+            s->codesize = value;
+            break;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                            "%s: writing a bad offset 0x%x\n",
+                            __func__,
+                            (int)offset);
+            break;
+    };
+}
+
+static const MemoryRegionOps nrf51_ficr_ops = {
+    .read = nrf51_ficr_read,
+    .write = nrf51_ficr_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static const VMStateDescription vmstate_nrf51_ficr = {
+    .name = TYPE_NRF51_FICR,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(codepagesize, NRF51FICRState),
+        VMSTATE_UINT32(codesize, NRF51FICRState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static Property nrf51_ficr_properties[] = {
+    DEFINE_PROP_UINT32("codepagesize", NRF51FICRState, codepagesize, 4096),
+    DEFINE_PROP_UINT32("codesize", NRF51FICRState, codesize, 64),
+    DEFINE_PROP_END_OF_LIST()
+};
+
+static void nrf51_ficr_init(Object *obj)
+{
+    NRF51FICRState *s = NRF51_FICR(obj);
+    SysBusDevice *sdb = SYS_BUS_DEVICE(obj);
+
+    memory_region_init_io(&s->iomem, obj, &nrf51_ficr_ops, s,
+                          TYPE_NRF51_FICR, 0x1000);
+    sysbus_init_mmio(sdb, &s->iomem);
+}
+
+static void nrf51_ficr_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->props = nrf51_ficr_properties;
+    dc->vmsd = &vmstate_nrf51_ficr;
+}
+
+static const TypeInfo nrf51_ficr_info = {
+    .name          = TYPE_NRF51_FICR,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(NRF51FICRState),
+    .instance_init = nrf51_ficr_init,
+    .class_init    = nrf51_ficr_class_init,
+};
+
+/**
+ * NRF51 CLOCK & POWER & MPU
+ *   With respect to nRF51822 Reference Manual
+ *   NOTE: incomplete implementation
+ *         timer does not need clock input,
+ *         so the clock is a fake one
+ */
+
+#define TYPE_NRF51_CPM "nrf51_clock_power_mpu"
+#define NRF51_CPM(obj) \
+    OBJECT_CHECK(NRF51CPMState, (obj), TYPE_NRF51_CPM)
+
+typedef struct {
+    /* Private */
+    SysBusDevice parent;
+
+    /* Public */
+    MemoryRegion iomem;
+
+    /* Clock */
+    bool hfclk_enabled;
+    bool lfclk_enabled;
+
+    /* Power */
+    bool ramon;
+} NRF51CPMState;
+
+enum {
+    NRF51_CLK_HFCLKSTART   = 0x000,
+    NRF51_CLK_HFCLKSTOP    = 0x004,
+    NRF51_CLK_LFCLKSTART   = 0x008,
+    NRF51_CLK_LFCLKSTOP    = 0x00C,
+    NRF51_CLK_HFCLKSTARTED = 0x100,
+    NRF51_CLK_LFCLKSTARTED = 0x104,
+    NRF51_CLK_CAL          = 0x010,
+    NRF51_CLK_CTSTART      = 0x014,
+    NRF51_CLK_CTSTOP       = 0x018,
+    NRF51_CLK_INTENSET     = 0x304,
+    NRF51_CLK_INTENCLR     = 0x308,
+    NRF51_CLK_HFCLKRUN     = 0x408,
+    NRF51_CLK_HFCLKSTAT    = 0x40c,
+    NRF51_CLK_LFCLKRUN     = 0x414,
+    NRF51_CLK_LFCLKSTAT    = 0x418,
+    NRF51_CLK_LFCLKSRCCOPY = 0x41c,
+    NRF51_CLK_LFCLKSRC     = 0x518,
+    NRF51_CLK_CTIV         = 0x538,
+    NRF51_CLK_XTALFREQ     = 0x550,
+    NRF51_PWR_RAMON        = 0x524,
+    NRF51_UNKNOWN_VAL      = 0,
+};
+
+static uint64_t nrf51_cpm_read(void *opaque, hwaddr offset,
+                               unsigned size)
+{
+    NRF51CPMState *s = (NRF51CPMState *)opaque;
+
+    switch (offset) {
+        case NRF51_CLK_HFCLKSTART:
+        case NRF51_CLK_LFCLKSTART:
+        case NRF51_CLK_HFCLKSTOP:
+        case NRF51_CLK_LFCLKSTOP:
+            return 0;
+        case NRF51_CLK_HFCLKSTARTED:
+            return s->hfclk_enabled;
+        case NRF51_CLK_LFCLKSTARTED:
+            return s->lfclk_enabled;
+        case NRF51_PWR_RAMON:
+            return s->ramon;
+        case NRF51_CLK_LFCLKSRC:
+            return NRF51_UNKNOWN_VAL;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                            "%s: reading a bad offset 0x%x\n",
+                            __func__,
+                            (int)offset);
+            return 0;
+    };
+}
+
+static void nrf51_cpm_write(void *opaque, hwaddr offset,
+                            uint64_t value, unsigned size)
+{
+    NRF51CPMState *s = (NRF51CPMState *)opaque;
+
+    switch (offset) {
+        case NRF51_CLK_HFCLKSTART:
+            s->hfclk_enabled = (value & 1);
+            break;
+        case NRF51_CLK_LFCLKSTART:
+            s->lfclk_enabled = (value & 1);
+            break;
+        case NRF51_CLK_HFCLKSTOP:
+            s->hfclk_enabled = (value & 1) ? false : true;
+            break;
+        case NRF51_CLK_LFCLKSTOP:
+            s->lfclk_enabled = (value & 1) ? false : true;
+            break;
+        case NRF51_CLK_HFCLKSTARTED:
+        case NRF51_CLK_LFCLKSTARTED:
+            break;
+        case NRF51_PWR_RAMON:
+            s->ramon = value & 0x00030003;
+            break;
+        case NRF51_CLK_LFCLKSRC:
+            break;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                            "%s: writing a bad offset 0x%x\n",
+                            __func__,
+                            (int)offset);
+            break;
+    };
+}
+
+static const MemoryRegionOps nrf51_cpm_ops = {
+    .read = nrf51_cpm_read,
+    .write = nrf51_cpm_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static const VMStateDescription vmstate_nrf51_cpm = {
+    .name = TYPE_NRF51_CPM,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_BOOL(hfclk_enabled, NRF51CPMState),
+        VMSTATE_BOOL(lfclk_enabled, NRF51CPMState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static Property nrf51_cpm_properties[] = {
+    DEFINE_PROP_BOOL("hfclk_enabled", NRF51CPMState, hfclk_enabled, false),
+    DEFINE_PROP_BOOL("lfclk_enabled", NRF51CPMState, lfclk_enabled, false),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
+static void nrf51_cpm_init(Object *obj)
+{
+    NRF51CPMState *s = NRF51_CPM(obj);
+    SysBusDevice *sdb = SYS_BUS_DEVICE(obj);
+
+    memory_region_init_io(&s->iomem, obj, &nrf51_cpm_ops, s,
+                          TYPE_NRF51_CPM, 0x1000);
+    sysbus_init_mmio(sdb, &s->iomem);
+}
+
+static void nrf51_cpm_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->props = nrf51_cpm_properties;
+    dc->vmsd = &vmstate_nrf51_cpm;
+}
+
+static const TypeInfo nrf51_cpm_info = {
+    .name          = TYPE_NRF51_CPM,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(NRF51CPMState),
+    .instance_init = nrf51_cpm_init,
+    .class_init    = nrf51_cpm_class_init,
+};
 
 /**
  * NRF51 Timer
@@ -67,52 +655,81 @@ typedef struct {
     uint32_t internal_counter;
 } NRF51TimerState;
 
+enum {
+    NRF51_TIMER_START     = 0x000,
+    NRF51_TIMER_STOP      = 0x004,
+    NRF51_TIMER_COUNT     = 0x008,
+    NRF51_TIMER_CLEAR     = 0x00C,
+    NRF51_TIMER_SHUTDOWN  = 0x010,
+    NRF51_TIMER_CAPTURE0  = 0x040,
+    NRF51_TIMER_CAPTURE1  = 0x044,
+    NRF51_TIMER_CAPTURE2  = 0x048,
+    NRF51_TIMER_CAPTURE3  = 0x04C,
+    NRF51_TIMER_COMPARE0  = 0x140,
+    NRF51_TIMER_COMPARE1  = 0x144,
+    NRF51_TIMER_COMPARE2  = 0x148,
+    NRF51_TIMER_COMPARE3  = 0x14C,
+    NRF51_TIMER_SHORTS    = 0x200,
+    NRF51_TIMER_INTENSET  = 0x304,
+    NRF51_TIMER_INTENCLR  = 0x308,
+    NRF51_TIMER_MODE      = 0x504,
+    NRF51_TIMER_BITMODE   = 0x508,
+    NRF51_TIMER_PRESCALER = 0x510,
+    NRF51_TIMER_CC0       = 0x540,
+    NRF51_TIMER_CC1       = 0x544,
+    NRF51_TIMER_CC2       = 0x548,
+    NRF51_TIMER_CC3       = 0x54C,
+};
+
 static uint64_t nrf51_timer_read(void *opaque, hwaddr offset,
                                  unsigned size)
 {
     NRF51TimerState *s = (NRF51TimerState *)opaque;
 
     switch (offset) {
-        case 0x000:
+        case NRF51_TIMER_START:
             return s->start;
-        case 0x004:
+        case NRF51_TIMER_STOP:
             return s->stop;
-        case 0x008:
+        case NRF51_TIMER_COUNT:
             return s->count;
-        case 0x00c:
+        case NRF51_TIMER_CLEAR:
             return s->clear;
-        case 0x010:
+        case NRF51_TIMER_SHUTDOWN:
             return s->shutdown;
-        case 0x040:
-        case 0x044:
-        case 0x048:
-        case 0x04c:
-            return s->capture[(offset - 0x040) >> 2];
-        case 0x140:
-        case 0x144:
-        case 0x148:
-        case 0x14c:
-            return s->compare[(offset - 0x140) >> 2];
-        case 0x200:
+        case 0x020: /* TODO: remove temperory test port */
+            printf("%s: counter %d\n", __func__, s->internal_counter);
+            return s->internal_counter;
+        case NRF51_TIMER_CAPTURE0:
+        case NRF51_TIMER_CAPTURE1:
+        case NRF51_TIMER_CAPTURE2:
+        case NRF51_TIMER_CAPTURE3:
+            return s->capture[(offset >> 2) & 3];
+        case NRF51_TIMER_COMPARE0:
+        case NRF51_TIMER_COMPARE1:
+        case NRF51_TIMER_COMPARE2:
+        case NRF51_TIMER_COMPARE3:
+            return s->compare[(offset >> 2) & 3];
+        case NRF51_TIMER_SHORTS:
             return s->shorts;
-        case 0x304:
-        case 0x308:
+        case NRF51_TIMER_INTENSET:
+        case NRF51_TIMER_INTENCLR:
             qemu_log_mask(LOG_UNIMP,
                           "%s: `INTEN` not implemented when reading 0x%x\n",
                           __func__,
                           (int)offset);
             return 0;
-        case 0x504:
+        case NRF51_TIMER_MODE:
             return s->mode;
-        case 0x508:
+        case NRF51_TIMER_BITMODE:
             return s->bitmode;
-        case 0x510:
+        case NRF51_TIMER_PRESCALER:
             return s->prescaler;
-        case 0x540:
-        case 0x544:
-        case 0x548:
-        case 0x54c:
-            return s->cc[(offset - 0x540) >> 2];
+        case NRF51_TIMER_CC0:
+        case NRF51_TIMER_CC1:
+        case NRF51_TIMER_CC2:
+        case NRF51_TIMER_CC3:
+            return s->cc[(offset >> 2) & 3];
         default:
             qemu_log_mask(LOG_GUEST_ERROR,
                           "%s: reading a bad offset 0x%x\n",
@@ -141,35 +758,54 @@ static void nrf51_timer_write(void *opaque, hwaddr offset,
     NRF51TimerState *s = (NRF51TimerState *)opaque;
 
     switch (offset) {
-        case 0x000: /* Start */
+        case NRF51_TIMER_START: /* Start */
             if (value & 1) {
                 ptimer_set_freq(s->timer, s->freq);
-                if (!s->pulsed)
-                    nrf51_timer_recalibrate(s, 1);
-                else
+                switch (s->bitmode) {
+                    case 0:
+                        s->limit_mask = 0xffff;
+                        break;
+                    case 1:
+                        s->limit_mask = 0xff;
+                        break;
+                    case 2:
+                        s->limit_mask = 0xffffff;
+                        break;
+                    case 3:
+                        s->limit_mask = 0xffffffff;
+                        break;
+                    default:
+                        g_assert_not_reached();
+                        break;
+                }
+                if (s->pulsed)
                     s->pulsed = false;
+                else
+                    nrf51_timer_recalibrate(s, 1);
                 ptimer_run(s->timer, 0);
+                printf("Timer start.\n");
             }
             break;
-        case 0x004: /* Stop */
+        case NRF51_TIMER_STOP: /* Stop */
             if (value & 1) {
                 ptimer_stop(s->timer);
                 s->pulsed = true;
             }
             break;
-        case 0x008: /* Count */
-            if (s->bitmode & 1) {
+        case NRF51_TIMER_COUNT: /* Count */
+            printf("%s: set count to %d\n", __func__, s->count);
+            if (s->mode & 1) {
                 s->count = value;
                 nrf51_timer_recalibrate(s, 1);
             }
             break;
-        case 0x00c: /* Clear */
+        case NRF51_TIMER_CLEAR: /* Clear */
             if (value & 1) {
                 s->internal_counter = 0;
                 nrf51_timer_recalibrate(s, 1);
             }
             break;
-        case 0x010: /* Shutdown */
+        case NRF51_TIMER_SHUTDOWN: /* Shutdown */
             if (value & 1) {
                 ptimer_stop(s->timer);
                 s->internal_counter = 0;
@@ -177,63 +813,48 @@ static void nrf51_timer_write(void *opaque, hwaddr offset,
                 s->pulsed = false;
             }
             break;
-        case 0x040: /* Capture[0:3] */
-        case 0x044:
-        case 0x048:
-        case 0x04c:
+        case NRF51_TIMER_CAPTURE0:
+        case NRF51_TIMER_CAPTURE1:
+        case NRF51_TIMER_CAPTURE2:
+        case NRF51_TIMER_CAPTURE3:
             s->cc[(offset >> 2) & 0x3] = s->internal_counter;
             break;
-        case 0x140: /* Compare[0:3] */
-        case 0x144:
-        case 0x148:
-        case 0x14c:
+        case NRF51_TIMER_COMPARE0:
+        case NRF51_TIMER_COMPARE1:
+        case NRF51_TIMER_COMPARE2:
+        case NRF51_TIMER_COMPARE3:
             s->compare[(offset >> 2) & 0x3] = value;
             break;
-        case 0x200: /* Shorts */
+        case NRF51_TIMER_SHORTS: /* Shorts */
             qemu_log_mask(LOG_UNIMP,
                           "%s: `SHORTS` not implemented when writing 0x%x\n",
                           __func__,
                           (int)offset);
             break;
-        case 0x304: /* Intenset */
+        case NRF51_TIMER_INTENSET: /* Intenset */
             s->inten |= (value >> 16) & 0xf;
             break;
-        case 0x308:
+        case NRF51_TIMER_INTENCLR:
             /* TODO: verify this formula */
             s->inten &= (~(value >> 16)) & 0xf;
             break;
-        case 0x504:
+        case NRF51_TIMER_MODE:
             s->mode = value & 1;
+            printf("%s: set mode to %d.\n", __func__, s->mode);
             nrf51_timer_recalibrate(s, 1);
             break;
-        case 0x508:
+        case NRF51_TIMER_BITMODE:
             s->bitmode = value & 0x3;
-            switch (s->bitmode) {
-                case 0:
-                    s->limit_mask = 0xffff;
-                    break;
-                case 1:
-                    s->limit_mask = 0xff;
-                    break;
-                case 2:
-                    s->limit_mask = 0xffffff;
-                    break;
-                case 3:
-                    s->limit_mask = 0xffffffff;
-                    break;
-                default:
-                    g_assert_not_reached();
-                    break;
-            }
             break;
-        case 0x510:
+        case NRF51_TIMER_PRESCALER:
             s->prescaler = value & 0xf;
+            printf("%s: set prescaler to %d.\n", __func__, s->prescaler);
             nrf51_timer_recalibrate(s, 1);
             break;
-        case 0x540:
-        case 0x544:
-        case 0x548:
-        case 0x54c:
+        case NRF51_TIMER_CC0:
+        case NRF51_TIMER_CC1:
+        case NRF51_TIMER_CC2:
+        case NRF51_TIMER_CC3:
             s->cc[(offset >> 2) & 0x3] = value;
             break;
         default:
@@ -251,18 +872,29 @@ static void nrf51_timer_tick(void *opaque)
     int i;
 
     s->internal_counter = (s->internal_counter + 1) & s->limit_mask;
-    
-    /* Compare */
-    for (i = 0; i < 4; i++) {
-        if (s->inten & (1 << i)) {
-            if (s->cc[i] == s->internal_counter) {
-                s->compare[i] ++;
-                qemu_irq_raise(s->irq);
-            }
+
+    if (s->mode == 1) {
+        /* Counter mode */
+        if (s->internal_counter == s->count){
+            s->internal_counter = 0;
+            qemu_irq_raise(s->irq);
         } else {
             qemu_irq_lower(s->irq);
         }
+    } else {
+        /* Timer mode */
+        for (i = 0; i < 4; i++) {
+            if (s->inten & (1 << i)) {
+                if (s->cc[i] == s->internal_counter) {
+                    s->compare[i] ++;
+                    qemu_irq_raise(s->irq);
+                } else {
+                    qemu_irq_lower(s->irq);
+                }
+            }
+        }
     }
+    
 }
 
 static const MemoryRegionOps nrf51_timer_ops = {
@@ -308,7 +940,7 @@ static void nrf51_timer_realize(DeviceState *dev, Error **errp)
 {
     NRF51TimerState *s = NRF51_TIMER(dev);
     QEMUBH *bh = qemu_bh_new(nrf51_timer_tick, s);
-    s->timer = ptimer_init(bh, PTIMER_POLICY_DEFAULT);
+    s->timer = ptimer_init(bh, PTIMER_POLICY_DEFAULT | PTIMER_POLICY_CONTINUOUS_TRIGGER);
     s->freq = NRF51_TIMER_BASE_FREQ;
 }
 
@@ -340,9 +972,12 @@ static const TypeInfo nrf51_timer_info = {
     .class_init    = nrf51_timer_class_init,
 };
 
-
 static void nrf51_peri_init_types(void)
 {
+    type_register_static(&nrf51_rng_info);
+    type_register_static(&nrf51_nvmc_info);
+    type_register_static(&nrf51_ficr_info);
+    type_register_static(&nrf51_cpm_info);
     type_register_static(&nrf51_timer_info);    
 }
 
@@ -425,7 +1060,10 @@ enum {
     LPCOMP_BASE   = 0x40013000,
     SWI_BASE      = 0x40014000,
     NVMC_BASE     = 0x4001E000,
-    PPI_BASE      = 0x4001F000
+    PPI_BASE      = 0x4001F000,
+    GPIO_BASE     = 0x50000000,
+    FICR_BASE     = 0x10000000,
+    UICR_BASE     = 0x10001000,
 };
 
 static void microbit_cpu_reset(void *opaque)
@@ -460,11 +1098,53 @@ static void microbit_copy_vector(MemoryRegion *dest_mem, hwaddr src_base)
     }
 }
 
+typedef struct {
+    const char * name;
+    uint32_t base_addr;
+    uint32_t size;
+} microbit_device_info;
+
+static const microbit_device_info unimp_devices[] = {
+    {"radio",  RADIO_BASE,  0x1000},
+    {"uart0",  UART0_BASE,  0x1000},
+    {"spi0",   SPI0_BASE,   0x1000},
+    {"twi0",   TWI0_BASE,   0x1000},
+    {"spi1",   SPI1_BASE,   0x1000},
+    {"twi1",   TWI1_BASE,   0x1000},
+    {"spis1",  SPIS1_BASE,  0x1000},
+    {"spim1",  SPIM1_BASE,  0x1000},
+    {"gpiote", GPIOTE_BASE, 0x1000},
+    {"adc",    ADC_BASE,    0x1000},
+    {"rtc0",   RTC0_BASE,   0x1000},
+    {"temp",   TEMP_BASE,   0x1000},
+    {"ecb",    ECB_BASE,    0x1000},
+    {"aar",    AAR_BASE,    0x1000},
+    {"ccm",    CCM_BASE,    0x1000},
+    {"wdt",    WDT_BASE,    0x1000},
+    {"rtc1",   RTC1_BASE,   0x1000},
+    {"qdec",   QDEC_BASE,   0x1000},
+    {"lpcomp", LPCOMP_BASE, 0x1000},
+    {"swi",    SWI_BASE,    0x1000},
+    {"ppi",    PPI_BASE,    0x1000},
+    {"uicr",   UICR_BASE,   0x1000},
+    {"gpio",   GPIO_BASE,   0x1000},
+    {"unknown",0xF0000000,  0x1000},
+};
+
+static void microbit_create_unimp_devices(void)
+{
+    int i;
+    for (i = 0; i < sizeof(unimp_devices) / sizeof(microbit_device_info); i++) {
+        create_unimplemented_device(unimp_devices[i].name,
+                                    unimp_devices[i].base_addr,
+                                    unimp_devices[i].size);
+    }
+}
+
 static void microbit_init(MachineState *machine)
 {
     MemoryRegion *ram = g_new(MemoryRegion, 1);
     MemoryRegion *code_loader = g_new(MemoryRegion, 1);
-    MemoryRegion *apb_peri = g_new(MemoryRegion, 1);
     DriveInfo *dinfo;
     pflash_t *flash;
 
@@ -520,10 +1200,11 @@ static void microbit_init(MachineState *machine)
     }
 
     /* Peripherals */
-    memory_region_init(apb_peri, NULL, "microbit.apb_peripheral",
-                       ABP_PERI_SIZE);
-    memory_region_add_subregion(get_system_memory(), ABP_PERI_BASE, apb_peri);
-    create_unimplemented_device("pwr_clk_mpu", POWER_BASE, 0x1000);
+    microbit_create_unimp_devices();
+    sysbus_create_simple(TYPE_NRF51_RNG, RNG_BASE, NULL);
+    sysbus_create_simple(TYPE_NRF51_NVMC, NVMC_BASE, NULL);
+    sysbus_create_simple(TYPE_NRF51_FICR, FICR_BASE, NULL);
+    sysbus_create_simple(TYPE_NRF51_CPM, CLOCK_BASE, NULL);
     sysbus_create_simple(TYPE_NRF51_TIMER, TIMER0_BASE,
                          qdev_get_gpio_in(armv7m, 8));
     sysbus_create_simple(TYPE_NRF51_TIMER, TIMER1_BASE,
