@@ -70,12 +70,68 @@ static uint64_t microbit_led_matrix_read(void *opaque, hwaddr addr,
     return s->led_state;
 }
 
+typedef struct {
+    int x;
+    int y;
+} matrix_point_t;
+
+static const matrix_point_t matrix_map[3 * 9] = {
+    /* Row 2 Col 8 and 9 not used, set as (5,5) */
+    {0,0},{4,2},{2,4},
+    {2,0},{0,2},{4,4},
+    {4,0},{2,2},{0,4},
+    {4,3},{1,0},{0,1},
+    {3,3},{3,0},{1,1},
+    {2,3},{3,4},{2,1},
+    {1,3},{1,4},{3,1},
+    {0,3},{5,5},{4,1},
+    {1,2},{5,5},{3,2},
+};
+
 static void microbit_led_matrix_write(void *opaque, hwaddr addr,
                                       uint64_t val, unsigned size)
 {
     MICROBITLedMatrixState *s = (MICROBITLedMatrixState *)opaque;
-    /* TODO: cope with nrf51_gpio style write */
-    s->led_state = val & MICROBIT_LED_MAP_MASK;
+
+    uint32_t clear_bits;
+    uint32_t row_bits = (val >> 4) & 7;
+    uint32_t col_bits = (val >> 7) & 0x1FF;
+    uint32_t led_bits = 0;
+    int index;
+    int row;
+
+    switch (row_bits) {
+        case 1:
+            clear_bits = 0x000f8815;
+            row = 0;
+            break;
+        case 2:
+            clear_bits = 0x00a0540a;
+            row = 1;
+            break;
+        case 4:
+            clear_bits = 0x015023e0;
+            row = 2;
+            break;
+        default:
+            error_report("%s: invalid row bits %d\n", __func__, row_bits);
+            exit(1);
+    };
+
+    for (int col = 0; col < 9; col++) {
+        if ((row == 1) && ((col == 8) || (col == 9)))
+            continue;
+        
+        index = row + col * 3;
+        if (col_bits & (1 << col))
+            led_bits |= 1 << (matrix_map[index].x + matrix_map[index].y * 5);
+    }
+
+    s->led_state &= ~clear_bits;
+    s->led_state |= led_bits;
+    s->led_state &= MICROBIT_LED_MAP_MASK;
+
+    /* Redraw background and front */
     s->led_event = MICROBIT_LED_EVENT_BACK | MICROBIT_LED_EVENT_FRONT;
 }
 
@@ -150,23 +206,23 @@ static void microbit_led_matrix_update_display(void *opaque)
 
     switch (bits_per_pixel) {
         case 8:
-            front_color = rgb_to_pixel8(0x00, 0xff, 0xff);
+            front_color = rgb_to_pixel8(0xFF, 0xFF, 0xFF);
             break;
         case 15:
-            front_color = rgb_to_pixel15(0x00, 0xff, 0xff);
+            front_color = rgb_to_pixel15(0xFF, 0xFF, 0xFF);
             break;
         case 16:
-            front_color = rgb_to_pixel16(0x00, 0xff, 0xff);
+            front_color = rgb_to_pixel16(0xFF, 0xFF, 0xFF);
             break;
         case 24:
-            front_color = rgb_to_pixel24(0x00, 0xff, 0xff);
+            front_color = rgb_to_pixel24(0xFF, 0xFF, 0xFF);
             break;
         case 32:
-            front_color = rgb_to_pixel32(0x00, 0xff, 0xff);
+            front_color = rgb_to_pixel32(0xFF, 0xFF, 0xFF);
             break;
         default:
             error_report("microbit internal error: " \
-                         "[%s] can't handle %d bit color",
+                         "[%s] can't handle %d bit color\n",
                          __func__, bits_per_pixel);
             exit(1);
     }
