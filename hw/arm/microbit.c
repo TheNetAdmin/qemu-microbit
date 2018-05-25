@@ -94,8 +94,8 @@ static void microbit_led_matrix_write(void *opaque, hwaddr addr,
     MICROBITLedMatrixState *s = (MICROBITLedMatrixState *)opaque;
 
     uint32_t clear_bits;
-    uint32_t row_bits = (val >> 4) & 7;
-    uint32_t col_bits = (~(val >> 7)) & 0x1FF;
+    uint32_t row_bits = (val >> 13) & 7;
+    uint32_t col_bits = (~(val >> 4)) & 0x1FF;
     uint32_t led_bits = 0;
     int index;
     int row;
@@ -114,7 +114,7 @@ static void microbit_led_matrix_write(void *opaque, hwaddr addr,
             row = 2;
             break;
         default:
-            printf("%s: abort due to wrong row bits %d\n", __func__, row_bits);
+            // printf("%s: abort due to wrong row bits %d\n", __func__, row_bits);
             return;
     };
 
@@ -1358,9 +1358,6 @@ static uint64_t nrf51_timer_read(void *opaque, hwaddr offset,
             return s->clear;
         case NRF51_TIMER_SHUTDOWN:
             return s->shutdown;
-        case 0x020: /* TODO: remove temperory test port */
-            printf("%s: counter %d\n", __func__, s->internal_counter);
-            return s->internal_counter;
         case NRF51_TIMER_CAPTURE0:
         case NRF51_TIMER_CAPTURE1:
         case NRF51_TIMER_CAPTURE2:
@@ -1444,7 +1441,6 @@ static void nrf51_timer_write(void *opaque, hwaddr offset,
                 else
                     nrf51_timer_recalibrate(s, 1);
                 ptimer_run(s->timer, 0);
-                printf("Timer start.\n");
             }
             break;
         case NRF51_TIMER_STOP: /* Stop */
@@ -1501,7 +1497,6 @@ static void nrf51_timer_write(void *opaque, hwaddr offset,
             break;
         case NRF51_TIMER_MODE:
             s->mode = value & 1;
-            printf("%s: set mode to %d.\n", __func__, s->mode);
             nrf51_timer_recalibrate(s, 1);
             break;
         case NRF51_TIMER_BITMODE:
@@ -1509,7 +1504,6 @@ static void nrf51_timer_write(void *opaque, hwaddr offset,
             break;
         case NRF51_TIMER_PRESCALER:
             s->prescaler = value & 0xf;
-            printf("%s: set prescaler to %d.\n", __func__, s->prescaler);
             nrf51_timer_recalibrate(s, 1);
             break;
         case NRF51_TIMER_CC0:
