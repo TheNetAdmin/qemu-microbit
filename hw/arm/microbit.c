@@ -95,7 +95,7 @@ static void microbit_led_matrix_write(void *opaque, hwaddr addr,
 
     uint32_t clear_bits;
     uint32_t row_bits = (val >> 4) & 7;
-    uint32_t col_bits = (val >> 7) & 0x1FF;
+    uint32_t col_bits = (~(val >> 7)) & 0x1FF;
     uint32_t led_bits = 0;
     int index;
     int row;
@@ -114,8 +114,8 @@ static void microbit_led_matrix_write(void *opaque, hwaddr addr,
             row = 2;
             break;
         default:
-            error_report("%s: invalid row bits %d\n", __func__, row_bits);
-            exit(1);
+            printf("%s: abort due to wrong row bits %d\n", __func__, row_bits);
+            return;
     };
 
     for (int col = 0; col < 9; col++) {
@@ -130,6 +130,7 @@ static void microbit_led_matrix_write(void *opaque, hwaddr addr,
     s->led_state &= ~clear_bits;
     s->led_state |= led_bits;
     s->led_state &= MICROBIT_LED_MAP_MASK;
+    // printf("%s: led_state 0x%08x\n", __func__, s->led_state);
 
     /* Redraw background and front */
     s->led_event = MICROBIT_LED_EVENT_BACK | MICROBIT_LED_EVENT_FRONT;
@@ -498,7 +499,11 @@ static void nrf51_gpio_pin_dir_update(NRF51GPIOState *s)
 
 static void nrf51_gpio_write_out(NRF51GPIOState *s)
 {
-    /* TODO: update */
+    AddressSpace *as = cpu_get_address_space(CPU(first_cpu), 0);
+    if (s->out & 0x0000FFF0) {
+        stw_phys(as, 0x40020000, s->out & 0x0000FFF0);
+    }
+    s->out = 0;
 }
 
 static void nrf51_gpio_read_in(NRF51GPIOState *s)
@@ -573,15 +578,15 @@ static void nrf51_gpio_write(void *opaque, hwaddr offset,
 
     switch (offset) {
         case NRF51_GPIO_OUT:
-            s->out = value;
+            s->out = value & s->dir;
             nrf51_gpio_write_out(s);
             break;
         case NRF51_GPIO_OUTSET:
-            s->out |= value;
+            s->out |= value & s->dir;
             nrf51_gpio_write_out(s);
             break;
         case NRF51_GPIO_OUTCLR:
-            s->out &= ~((uint32_t)value);
+            s->out &= ~((uint32_t)value) & s->dir;
             nrf51_gpio_write_out(s);
             break;
         case NRF51_GPIO_DIR:
@@ -1276,8 +1281,8 @@ typedef struct {
 
     /* Public */
     MemoryRegion iomem;
-    ptimer_state *timer;
     qemu_irq irq;
+    ptimer_state *timer;
     bool pulsed;
     uint32_t inten;
     uint32_t limit_mask;
@@ -1533,7 +1538,7 @@ static void nrf51_timer_tick(void *opaque)
         /* Counter mode */
         if (s->internal_counter == s->count){
             s->internal_counter = 0;
-            qemu_irq_raise(s->irq);
+            qemu_irq_pulse(s->irq);
         } else {
             qemu_irq_lower(s->irq);
         }
@@ -1543,7 +1548,7 @@ static void nrf51_timer_tick(void *opaque)
             if (s->inten & (1 << i)) {
                 if (s->cc[i] == s->internal_counter) {
                     s->compare[i] ++;
-                    qemu_irq_raise(s->irq);
+                    qemu_irq_pulse(s->irq);
                 } else {
                     qemu_irq_lower(s->irq);
                 }
